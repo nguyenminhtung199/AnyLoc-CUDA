@@ -488,3 +488,150 @@ class VLAD:
             except TypeError:
                 pass    # Let it remain as a list
         return res
+
+class VLAD_CUDA:
+    """
+    An implementation of VLAD algorithm given database and query descriptors.
+    """
+
+    def __init__(self, num_clusters: int, desc_dim: Union[int, None] = None,
+                 intra_norm: bool = True, norm_descs: bool = True,
+                 dist_mode: str = "cosine", vlad_mode: str = "hard",
+                 soft_temp: float = 1.0, cache_dir: Union[str, None] = None) -> None:
+        self.num_clusters = num_clusters
+        self.desc_dim = desc_dim
+        self.intra_norm = intra_norm
+        self.norm_descs = norm_descs
+        self.mode = dist_mode
+        self.vlad_mode = str(vlad_mode).lower()
+        assert self.vlad_mode in ['soft', 'hard']
+        self.soft_temp = soft_temp
+        self.c_centers = None
+        self.kmeans = None
+        self.cache_dir = cache_dir
+        if self.cache_dir is not None:
+            self.cache_dir = os.path.abspath(os.path.expanduser(self.cache_dir))
+            if not os.path.exists(self.cache_dir):
+                os.makedirs(self.cache_dir)
+                print(f"Created cache directory: {self.cache_dir}")
+            else:
+                print(f"Warning: Cache directory already exists: {self.cache_dir}")
+        else:
+            print("VLAD caching is disabled.")
+    
+    def can_use_cache_vlad(self):
+        if self.cache_dir is None:
+            return False
+        if not os.path.exists(self.cache_dir):
+            return False
+        return os.path.exists(f"{self.cache_dir}/c_centers.pt")
+    
+    def can_use_cache_ids(self, cache_ids: Union[List[str], str, None], only_residuals: bool = False) -> bool:
+        if not self.can_use_cache_vlad():
+            return False
+        if cache_ids is None:
+            return False
+        if isinstance(cache_ids, str):
+            cache_ids = [cache_ids]
+        for cache_id in cache_ids:
+            if not os.path.exists(f"{self.cache_dir}/{cache_id}_r.pt"):
+                return False
+            if self.vlad_mode == "hard" and not os.path.exists(f"{self.cache_dir}/{cache_id}_l.pt") and not only_residuals:
+                return False
+            if self.vlad_mode == "soft" and not os.path.exists(f"{self.cache_dir}/{cache_id}_s.pt") and not only_residuals:
+                return False
+        return True
+    
+    def fit(self, train_descs: Union[np.ndarray, torch.Tensor, None]):
+        self.kmeans = fpk.KMeans(self.num_clusters, mode=self.mode)
+        if self.can_use_cache_vlad():
+            print("Using cached cluster centers")
+            self.c_centers = torch.load(f"{self.cache_dir}/c_centers.pt").to('cuda')
+            self.kmeans.centroids = self.c_centers
+            if self.desc_dim is None:
+                self.desc_dim = self.c_centers.shape[1]
+                print(f"Desc dim set to {self.desc_dim}")
+        else:
+            if train_descs is None:
+                raise ValueError("No training descriptors given")
+            if isinstance(train_descs, np.ndarray):
+                train_descs = torch.from_numpy(train_descs).to(torch.float32).to('cuda')
+            if self.desc_dim is None:
+                self.desc_dim = train_descs.shape[1]
+            if self.norm_descs:
+                train_descs = F.normalize(train_descs)
+            self.kmeans.fit(train_descs)
+            self.c_centers = self.kmeans.centroids.to('cuda')
+            if self.cache_dir is not None:
+                print("Caching cluster centers")
+                torch.save(self.c_centers, f"{self.cache_dir}/c_centers.pt")
+    
+    def fit_and_generate(self, train_descs: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+        self.fit(train_descs)
+        return torch.stack([self.generate(tr.to('cuda')) for tr in train_descs])
+    
+    def generate(self, query_descs: Union[np.ndarray, torch.Tensor], cache_id: Union[str, None] = None) -> torch.Tensor:
+        query_descs = query_descs.to('cuda')
+        residuals = self.generate_res_vec(query_descs, cache_id)
+        un_vlad = torch.zeros(self.num_clusters * self.desc_dim, device='cuda')
+        
+        if self.vlad_mode == 'hard':
+            if cache_id is not None and self.can_use_cache_vlad() and os.path.isfile(f"{self.cache_dir}/{cache_id}_l.pt"):
+                labels = torch.load(f"{self.cache_dir}/{cache_id}_l.pt").to('cuda')
+            else:
+                labels = self.kmeans.predict(query_descs).to('cuda')
+                if cache_id is not None and self.can_use_cache_vlad():
+                    torch.save(labels, f"{self.cache_dir}/{cache_id}_l.pt")
+            used_clusters = set(labels.cpu().numpy())
+            for k in used_clusters:
+                cd_sum = residuals[labels == k, k].sum(dim=0)
+                if self.intra_norm:
+                    cd_sum = F.normalize(cd_sum, dim=0)
+                un_vlad[k * self.desc_dim:(k + 1) * self.desc_dim] = cd_sum
+        else:
+            if cache_id is not None and self.can_use_cache_vlad() and os.path.isfile(f"{self.cache_dir}/{cache_id}_s.pt"):
+                soft_assign = torch.load(f"{self.cache_dir}/{cache_id}_s.pt").to('cuda')
+            else:
+                cos_sims = F.cosine_similarity(
+                    ein.rearrange(query_descs, "q d -> q 1 d"),
+                    ein.rearrange(self.c_centers, "c d -> 1 c d"),
+                    dim=2
+                )
+                soft_assign = F.softmax(self.soft_temp * cos_sims, dim=1)
+                if cache_id is not None and self.can_use_cache_vlad():
+                    torch.save(soft_assign, f"{self.cache_dir}/{cache_id}_s.pt")
+            for k in range(self.num_clusters):
+                w = ein.rearrange(soft_assign[:, k], "q -> q 1 1")
+                cd_sum = ein.rearrange(w * residuals, "q c d -> (q c) d").sum(dim=0)
+                if self.intra_norm:
+                    cd_sum = F.normalize(cd_sum, dim=0)
+                un_vlad[k * self.desc_dim:(k + 1) * self.desc_dim] = cd_sum
+
+        n_vlad = F.normalize(un_vlad, dim=0)
+        return n_vlad
+    
+    def generate_multi(self, multi_query: Union[np.ndarray, torch.Tensor, list], cache_ids: Union[List[str], None] = None) -> Union[torch.Tensor, list]:
+        if cache_ids is None:
+            cache_ids = [None] * len(multi_query)
+        res = [self.generate(q.to('cuda'), c) for (q, c) in zip(multi_query, cache_ids)]
+        return torch.stack(res)
+
+    def generate_res_vec(self, query_descs: Union[np.ndarray, torch.Tensor], cache_id: Union[str, None] = None) -> torch.Tensor:
+        query_descs = query_descs.to('cuda')
+        if cache_id is not None and self.can_use_cache_vlad() and os.path.isfile(f"{self.cache_dir}/{cache_id}_r.pt"):
+            residuals = torch.load(f"{self.cache_dir}/{cache_id}_r.pt").to('cuda')
+        else:
+            if isinstance(query_descs, np.ndarray):
+                query_descs = torch.from_numpy(query_descs).to(torch.float32).to('cuda')
+            if self.norm_descs:
+                query_descs = F.normalize(query_descs)
+            residuals = ein.rearrange(query_descs, "q d -> q 1 d") - ein.rearrange(self.c_centers, "c d -> 1 c d")
+            if cache_id is not None and self.can_use_cache_vlad():
+                torch.save(residuals, f"{self.cache_dir}/{cache_id}_r.pt")
+        return residuals
+
+    def generate_multi_res_vec(self, multi_query: Union[np.ndarray, torch.Tensor, list], cache_ids: Union[List[str], None] = None) -> Union[torch.Tensor, list]:
+        if cache_ids is None:
+            cache_ids = [None] * len(multi_query)
+        res = [self.generate_res_vec(q.to('cuda'), c) for (q, c) in zip(multi_query, cache_ids)]
+        return torch.stack(res)
